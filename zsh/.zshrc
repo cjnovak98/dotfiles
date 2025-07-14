@@ -4,3 +4,5 @@ export PATH="${HOME}/.local/bin/backplane/latest:${PATH}:/Applications/Visual St
 
 eval "$(mise activate zsh)"
 eval "$(zoxide init --cmd cd zsh)"
+
+alias ls='ls --color'
