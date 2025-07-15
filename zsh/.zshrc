@@ -13,6 +13,7 @@ alias diff='diff --color=auto'
 alias ll='ls -l'
 alias l='ls'
 alias ls='ls --color'
+alias la='ls -al'
 
 autoload -U compinit && compinit
 autoload -Uz vcs_info
