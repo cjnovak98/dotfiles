@@ -1,0 +1,334 @@
+#!/usr/bin/env ruby
+
+# Creates a filesystem and environment context useful for exploring FedRAMP SREP
+# clusters and services.
+#
+# Uses the dry-cli Gem, install with `gem install dry-cli`.
+#
+# The program depends on the following userland tools:
+#
+#   - mise
+#   - fzf
+#   - openshift-online/ocm-cli
+#   - openshift/rosa
+#
+# The only thing currently stored outside of the base directory is the elevation
+# history file. Everything in the base directory can be blasted and regenerated
+# at will. The tool doesn't touch any files it doesn't own. Any other files
+# stored the environment should generally be safe from the tool, but do so at
+# your own risk. 
+#
+# The tool is reentrant and idempotent to a large degree but doesn't do any
+# sophisticated reconciliation, so when modifying the script, if in doubt about
+# obsoleted state, just delete parts (or all) of the tree and regenerate from
+# scratch.
+
+require 'dry/cli'
+require 'optparse'
+require 'json'
+require 'yaml'
+require 'pathname'
+require 'fileutils'
+
+module Commands
+  extend Dry::CLI::Registry
+
+  DEFAULT_DIR = File.join(ENV.fetch('HOME'), 'frenv')
+  VALID_ENVS = %w[int stage prod].freeze
+
+  class Login < Dry::CLI::Command
+    desc "Log in to an OCM environment and set up the local context."
+
+    argument :env, required: true, desc: "Environment to log into (one of #{VALID_ENVS.join(', ')})"
+    option :base_dir, type: :string, default: DEFAULT_DIR, desc: "Base directory for environment data"
+    option :region, type: :string, default: 'us-gov-west-1', desc: "AWS region for the login"
+
+    def call(env:, **options)
+      Commands::validate_env(env)
+      Operations::login(base_dir: options[:base_dir], env: env, region: options[:region])
+    end
+  end
+
+  class Sync < Dry::CLI::Command
+    desc "Sync OCM clusters for the specified environment."
+
+    argument :env, required: true, desc: "Environment to sync (one of #{VALID_ENVS.join(', ')})"
+    option :base_dir, type: :string, default: DEFAULT_DIR, desc: "Base directory where the environment exists"
+
+    def call(env:, **options)
+      Commands::validate_env(env)
+      Operations::sync(base_dir: options[:base_dir], env: env)
+    end
+  end
+
+  class Elevate < Dry::CLI::Command
+    desc "Set or select a reason for privilege elevation in the current cluster."
+
+    def call(**)
+      Operations::elevate(cluster_dir: Dir.pwd)
+    end
+  end
+
+  def self.validate_env(env)
+    unless VALID_ENVS.include?(env)
+      raise ArgumentError, "Error: `env` must be one of `#{VALID_ENVS.join(', ')}`, but was `#{env}`."
+    end
+  end
+
+  register "login", Login
+  register "sync", Sync
+  register "elevate", Elevate
+end
+
+module Operations
+  def self.login(base_dir:, env:, region:)
+    base_path = Pathname(base_dir)
+    raise "Missing base directory #{base_path}. Please create it first." unless base_path.directory?
+
+    env_path = (base_path/env).mkpath
+
+    rosa_env = { "int" => "integration", "stage" => "staging", "prod" => "production" }[env]
+    login_command = "OCM_CONFIG=#{env_path}/ocm-token rosa login --env #{rosa_env} --govcloud --admin --region #{region}"
+    puts "Running: #{login_command}"
+    system(login_command)
+
+    MiseConfig.new(env_path).set('OCM_CONFIG', '{{config_root}}/ocm-token')
+
+    get_token_script_path = env_path/'get-ocm-token'
+    get_token_script_path.write(<<~EOF)
+      #!/bin/bash
+      # This script is used by the generated kubeconfig to fetch OCM tokens.
+      token="$(ocm token)"
+      cat <<TOKEN
+      {
+        "apiVersion": "client.authentication.k8s.io/v1beta1",
+        "kind": "ExecCredential",
+        "status": {
+          "token": "$token"
+        }
+      }
+      TOKEN
+    EOF
+    get_token_script_path.chmod(0o755)
+
+    puts "🔑 Logged in to #{env}"
+  end
+
+  def self.sync(base_dir:, env:)
+    base_path = Pathname(base_dir)
+    raise "Missing base directory #{base_path}" unless base_path.directory?
+
+    env_path = base_path/env
+    raise "Missing environment directory #{env_path}, try logging in first" unless env_path.exist?
+
+    puts "Syncing #{env} (#{env_path})"
+
+    # Helper to run commands within the mise context
+    run_in_env = ->(cmd) { `mise exec --cd #{env_path} -- #{cmd}` }
+
+    ocm_account = JSON.parse(run_in_env.call('ocm whoami'))
+    puts "OCM account: #{JSON.dump(ocm_account)}"
+
+    backplane_url = JSON.parse(run_in_env.call('ocm get /api/clusters_mgmt/v1/environment'))['backplane_url']
+    raise "Backplane URL is absent from OCM environment" unless backplane_url
+
+    clusters = JSON.parse(run_in_env.call('ocm get /api/clusters_mgmt/v1/clusters'))['items']
+
+    clusters_path = (env_path/'clusters').mkpath
+    puts "Syncing #{clusters.length} clusters to #{clusters_path}"
+
+    history = ElevationHistory.new
+
+    clusters.each do |cluster|
+      cluster_id = cluster['id']
+      cluster_name = cluster['name']
+      cluster_path = clusters_path/cluster_name
+
+      puts "Syncing cluster #{cluster_name} to #{cluster_path}"
+
+      # Create two cluster contexts, one standard and one elevated
+      { cluster_path => false, cluster_path/'elevated' => true }.each do |current_path, is_elevated|
+        current_path.mkpath
+
+        # Store the cluster resource
+        (current_path/'cluster.json').write(JSON.pretty_generate(cluster))
+
+        # Ensure the mise environment
+        mise = MiseConfig.new(current_path)
+
+        # Generate a kubeconfig
+        kubeconfig = KubeConfig.build(
+          user_name: is_elevated ? 'elevated' : ENV.fetch('USER', 'user'),
+          cluster_name: cluster_name,
+          server_url: "#{backplane_url}/backplane/cluster/#{cluster_id}/"
+        ).with_ocm_auth(
+          script_path: (env_path/'get-ocm-token').to_s,
+          config_path: (env_path/'ocm-token').to_s
+        )
+
+        if is_elevated
+          # Restore any elevation history
+          kubeconfig.elevated
+          reason = "WARNING: No elevation reason"
+          if (latest_reason = history.latest_reason(cluster_id))
+            reason = latest_reason
+            puts "  -> Found previous elevation reason: '#{latest_reason}'"
+          end
+          kubeconfig.add_elevation_reason(reason)
+          mise.set('LAST_ELEVATE_REASON', reason)
+        end
+
+        kubeconfig.save!(current_path/'kubeconfig')
+        mise.set('KUBECONFIG', '{{config_root}}/kubeconfig')
+
+        # More useful environment stuff
+        mise.set('FR_CLUSTER_ID', cluster_id)
+        mise.set('FR_CLUSTER_NAME', cluster_name)
+      end
+    end
+  end
+
+  def self.elevate(cluster_dir:)
+    cluster_path = Pathname(cluster_dir)
+    cluster_json_path = cluster_path/'cluster.json'
+    kubeconfig_path = cluster_path/'kubeconfig'
+
+    raise "Not in a cluster directory (missing cluster.json)" unless cluster_json_path.file?
+    raise "Not in a cluster directory (missing kubeconfig)" unless kubeconfig_path.file?
+
+    cluster = JSON.load(cluster_json_path.read)
+    cluster_id = cluster['id']
+    
+    kubeconfig = KubeConfig.load(kubeconfig_path)
+    raise "The current kubeconfig doesn't appear to be for an elevated context." unless kubeconfig.is_elevated?
+
+    history = ElevationHistory.new
+    cluster_history = history.for_cluster(cluster_id)
+
+    fzf_command = 'fzf --height 20% --border --header "🚨 Select or enter an elevation reason" --print-query'
+
+    reason = IO.popen(fzf_command, 'r+') do |pipe|
+      cluster_history.each { |entry| pipe.puts(entry['reason']) }
+      pipe.close_write
+      pipe.read.lines.last&.strip
+    end
+
+    raise "🚫 Aborted. No changes made." if reason.nil? || reason.empty?
+
+    kubeconfig.add_elevation_reason(reason).save!(kubeconfig_path)
+    history.add(cluster_id, reason).save!
+    MiseConfig.new(cluster_path).set('LAST_ELEVATE_REASON', reason)
+
+    puts "Elevation reason updated: #{reason}"
+  end
+end
+
+# Encapsulates access to the mise configuration within a directory. The mise
+# config and trust settings are set up automatically on init.
+class MiseConfig
+  def initialize(directory)
+    @path = Pathname(directory)/'mise.toml'
+
+    FileUtils.touch(@path)
+    Dir.chdir(directory) { `mise trust -q` }
+  end
+
+  def set(key, value)
+    `mise set --file "#{@path}" #{key}="#{value}"`
+    self
+  end
+end
+
+# Provides a small builder around kubeconfigs and an abstraction for loading and
+# persistence.
+class KubeConfig
+  # Builds a new KubeConfig instance from scratch.
+  def self.build(user_name:, cluster_name:, server_url:)
+    config_hash = {
+      'apiVersion' => 'v1', 'kind' => 'Config', 'preferences' => {},
+      'clusters' => [{'name' => cluster_name, 'cluster' => { 'server' => server_url }}],
+      'users' => [{'name' => user_name, 'user' => {}}],
+      'contexts' => [
+        {'name' => "default/#{cluster_name}/#{user_name}", 'context' => { 'cluster' => cluster_name, 'user' => user_name, 'namespace' => 'default' }}],
+      'current-context' => "default/#{cluster_name}/#{user_name}"
+    }
+    new(config_hash)
+  end
+
+  # Loads a KubeConfig from an existing file path.
+  def self.load(path)
+    raise "Kubeconfig file not found at #{path}" unless path.exist?
+    new(YAML.load_file(path))
+  end
+
+  def is_elevated? = @config.dig('users', 0, 'user', 'as') == 'backplane-cluster-admin'
+
+  def add_elevation_reason(reason)
+    user_extra = @config.dig('users', 0, 'user', 'as-user-extra') || {}
+    user_extra['reason'] = [reason]
+    @config['users'][0]['user']['as-user-extra'] = user_extra
+    self
+  end
+
+  def with_ocm_auth(script_path:, config_path:)
+    @config['users'][0]['user']['exec'] = {
+      'apiVersion' => 'client.authentication.k8s.io/v1beta1', 'command' => 'bash',
+      'args' => [script_path], 'env' => [{'name' => 'OCM_CONFIG', 'value' => config_path}],
+      'provideClusterInfo' => false
+    }
+    self
+  end
+
+  def elevated
+    @config['users'][0]['user']['as'] = 'backplane-cluster-admin'
+    self
+  end
+
+  def save!(path)
+    path.write(YAML.dump(@config))
+    self
+  end
+
+  private
+
+  # The constructor is made private to enforce use of the factory methods.
+  private_class_method :new
+  def initialize(config_hash) = @config = config_hash
+end
+
+# Encapsulates persistent cluster elevation history. History is tracked by
+# cluster ID. Older entries with equivalent reason strings are automatically
+# pruned and the latest occurrence is prepended with a new timestamp.
+class ElevationHistory
+  DEFAULT_PATH = Pathname(Dir.home)/'.frenv-elevation-history.json'
+
+  def initialize(path: DEFAULT_PATH)
+    @path = path
+    @data = @path.exist? ? JSON.load(@path.read) : {}
+  end
+
+  # Returns an array of history entries for a given cluster ID.
+  def for_cluster(cluster_id) = @data.fetch(cluster_id.to_s, [])
+  
+  # Returns the most recent reason for a cluster, or nil if none exists.
+  def latest_reason(cluster_id) = for_cluster(cluster_id).first&.dig('reason')
+
+  # Adds a new reason to a cluster's history, placing it at the top
+  # and removing any previous occurrences of the same reason.
+  def add(cluster_id, reason)
+    key = cluster_id.to_s
+    # Get current history, rejecting any prior instance of the same reason.
+    updated_history = for_cluster(key).reject { |h| h['reason'] == reason }
+    # Prepend the new entry with a UTC timestamp.
+    @data[key] = [{'reason' => reason, 'timestamp' => Time.now.utc.iso8601}] + updated_history
+    self
+  end
+
+  # Saves the history data back to the file in a human-readable format.
+  def save!
+    puts "Created new history file at #{@path}" unless @path.exist?
+    @path.write(JSON.pretty_generate(@data))
+  end
+end
+
+Dry::CLI.new(Commands).call if $PROGRAM_NAME == __FILE__
